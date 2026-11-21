@@ -1,16 +1,22 @@
 // Bibliotecas
+#define _DEFAULT_SOURCE
+#define _BSD_SOURCE
+#define _GNU_SOURCE
+
 #include <ctype.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/types.h>
 #include <termios.h>
 #include <unistd.h>
 
 // Constantes
 #define BUFAN_INI {NULL, 0}
 #define ESC '\x1b'
+#define TAB_PARADA 8
 #define TECLA_CTRL(tecla)  ((tecla) & 0x1f)
 #define VERSAO "0.0.1"
 
@@ -27,10 +33,22 @@ enum editorTecla {
 };
 
 // Dados
+typedef struct editLinha {
+    int tam;
+    int renderTam;
+    char *chars;
+    char *render;
+} editLinha;
+
 struct editorConfiguracao {
     int cursorX, cursorY;
+    int renderX;
+    int linhaOffset;
+    int colunaOffset;
     int telaLinhas;
     int telaColunas;
+    int numLinhas;
+    editLinha *linha;
     struct termios termiosEstadoOriginal;
 };
 
@@ -169,22 +187,113 @@ int getTamanhoTela(int *linhas, int *colunas) {
     }
 }
 
+// Operações com linhas
+void editorAtualizarLinha(editLinha *linha)  {
+    int tabs = 0;
+    for(int i = 0; i < linha->tam; i++) {
+        if(linha->chars[i] == '\t') tabs++;
+    }
+
+    free(linha->render);
+    linha->render = malloc(linha->tam + tabs*(TAB_PARADA - 1) + 1);
+
+    int index = 0;
+    for(int i = 0; i < linha->tam; i++) {
+        if(linha->chars[i] == '\t') {
+            linha->render[index++] = ' ';
+            while(index % TAB_PARADA != 0) linha->render[index++] = ' ';
+        }
+        else linha->render[index++] = linha->chars[i];
+    }
+    linha->render[index] = '\0';
+    linha->renderTam = index;
+}
+
+void editorAnexarLinha(char *string, size_t tam) {
+    editConfig.linha = realloc(editConfig.linha, sizeof(editLinha) * (editConfig.numLinhas + 1));
+
+    int naLinha = editConfig.numLinhas; 
+    editConfig.linha[naLinha].tam = tam;
+    editConfig.linha[naLinha].chars = malloc(tam + 1);
+    memcpy(editConfig.linha[naLinha].chars, string, tam);
+    editConfig.linha[naLinha].chars[tam] = '\0';
+
+    editConfig.linha[naLinha].renderTam = 0;
+    editConfig.linha[naLinha].render = NULL;
+    editorAtualizarLinha(&editConfig.linha[naLinha]);
+
+    editConfig.numLinhas++;
+
+}
+
+int editorLinhaCxParaRx (editLinha *linha, int cx) {
+    int rx = 0;
+    for(int i = 0; i < cx; i++) {
+        if(linha->chars[i] == '\t')  
+            rx += (TAB_PARADA - 1) - (rx % TAB_PARADA);
+        rx++;
+    }
+    return rx;
+}
+
+// Arquivos i/o
+void editorAbrir(char *nomeArquivo) {
+    FILE *abrirArq = fopen(nomeArquivo, "r");
+    if(!abrirArq) erro("fopen");
+
+    char *linha = NULL;
+    size_t linhaCap = 0;
+    ssize_t linhaTam;
+    
+    while((linhaTam = getline(&linha, &linhaCap, abrirArq)) != -1) {
+        while(linhaTam > 0 && (linha[linhaTam - 1] == '\n' ||
+                                linha[linhaTam - 1] == '\r')) 
+            linhaTam--;
+        editorAnexarLinha(linha, linhaTam);
+    }
+    free(linha);
+    fclose(abrirArq);
+}
+
 // Output
+void editorScroll() {
+    editConfig.renderX = 0;
+    if(editConfig.cursorX < editConfig.numLinhas) {
+        editConfig.renderX = editorLinhaCxParaRx(&editConfig.linha[editConfig.cursorY], editConfig.cursorX);
+    }
+
+    if(editConfig.cursorY < editConfig.linhaOffset) editConfig.linhaOffset = editConfig.cursorY;
+    if(editConfig.cursorY >= editConfig.linhaOffset + editConfig.telaLinhas) 
+        editConfig.linhaOffset = editConfig.cursorY - editConfig.telaLinhas + 1;
+    if(editConfig.renderX < editConfig.colunaOffset) editConfig.colunaOffset = editConfig.renderX;
+    if(editConfig.renderX >= editConfig.colunaOffset + editConfig.telaColunas) 
+        editConfig.colunaOffset = editConfig.renderX - editConfig.telaColunas + 1;
+}
+
 void editorDesenharLinhas(struct bufferAnexo *bufan) {
     for(int y = 0; y < editConfig.telaLinhas; y++) {
-        if(y == editConfig.telaLinhas/3) {
-            char boasVindas[80];
-            int boasVindasTam = snprintf(boasVindas, sizeof(boasVindas), "Kilo - Editor de texto -- versão %s", VERSAO);
-            if(boasVindasTam > editConfig.telaColunas) boasVindasTam = editConfig.telaColunas;
-            int padding = (editConfig.telaColunas - boasVindasTam)/2;
-            if(padding) {
-                bufanAnexar(bufan, "||", 2);
-                padding--;
+        int arqLinha = y + editConfig.linhaOffset;
+        if(arqLinha >= editConfig.numLinhas) {
+            if(editConfig.numLinhas == 0 && y == editConfig.telaLinhas/3) {
+                char boasVindas[80];
+                int boasVindasTam = snprintf(boasVindas, sizeof(boasVindas), "Kilo - Editor de texto -- versão %s", VERSAO);
+                if(boasVindasTam > editConfig.telaColunas) boasVindasTam = editConfig.telaColunas;
+                int padding = (editConfig.telaColunas - boasVindasTam)/2;
+                if(padding) {
+                    bufanAnexar(bufan, "||", 2);
+                    padding--;
+                }
+                while(padding--) bufanAnexar(bufan, " ", 2);
+                bufanAnexar(bufan, boasVindas, boasVindasTam);
             }
-            while(padding--) bufanAnexar(bufan, " ", 1);
-            bufanAnexar(bufan, boasVindas, boasVindasTam);
+            else { bufanAnexar(bufan, "||", 2); }
         }
-        else { bufanAnexar(bufan, "||", 2); }
+        else {
+            int tam = editConfig.linha[arqLinha].renderTam - editConfig.colunaOffset;
+            if(tam < 0) tam = 0;
+            if(tam > editConfig.telaColunas) tam = editConfig.telaColunas;
+            bufanAnexar(bufan, &editConfig.linha[arqLinha].render[editConfig.colunaOffset], tam);
+        }
 
         bufanAnexar(bufan, "\x1b[K", 3);
         if(y < editConfig.telaLinhas - 1) {
@@ -194,6 +303,8 @@ void editorDesenharLinhas(struct bufferAnexo *bufan) {
 }
 
 void editorRecarregarTela() {
+    editorScroll();
+
     struct bufferAnexo bufan = BUFAN_INI;
     
     bufanAnexar(&bufan, "\x1b[?25l", 6);
@@ -202,7 +313,8 @@ void editorRecarregarTela() {
     editorDesenharLinhas(&bufan);
     
     char buffer[32];
-    snprintf(buffer, sizeof(buffer), "\x1b[%d;%dH", editConfig.cursorY +1, editConfig.cursorX +1);
+    snprintf(buffer, sizeof(buffer), "\x1b[%d;%dH", (editConfig.cursorY - editConfig.linhaOffset) +1,
+                                                    (editConfig.renderX - editConfig.colunaOffset) +1);
     bufanAnexar(&bufan, buffer, strlen(buffer));
 
     bufanAnexar(&bufan, "\x1b[?25h", 6);
@@ -213,20 +325,34 @@ void editorRecarregarTela() {
 
 // Input
 void editorMoverCursor(int tecla) {
+    editLinha *linha = (editConfig.cursorY >= editConfig.numLinhas) ? NULL : &editConfig.linha[editConfig.cursorY];
+
     switch(tecla) {
         case SETA_ESQUERDA:
             if(editConfig.cursorX != 0) editConfig.cursorX--;
+            else if(editConfig.cursorY > 0) {
+                editConfig.cursorY--;
+                editConfig.cursorX = editConfig.linha[editConfig.cursorY].tam;
+            }
             break;
         case SETA_DIREITA:
-            if(editConfig.cursorX != editConfig.telaColunas - 1) editConfig.cursorX++;
+            if(linha && editConfig.cursorX < linha->tam) editConfig.cursorX++;
+            else if(linha && editConfig.cursorX == linha->tam) {
+                editConfig.cursorY++;
+                editConfig.cursorX = 0;
+            }
             break;
         case SETA_CIMA:
             if(editConfig.cursorY != 0) editConfig.cursorY--;
             break;
         case SETA_BAIXO:
-            if(editConfig.cursorY != editConfig.telaLinhas - 1)editConfig.cursorY++;
+            if(editConfig.cursorY < editConfig.numLinhas) editConfig.cursorY++;
             break;
     }
+
+    linha = (editConfig.cursorY >= editConfig.numLinhas) ? NULL : &editConfig.linha[editConfig.cursorY];
+    int linhaTam = linha ? linha->tam : 0;
+    if(editConfig.cursorX > linhaTam) editConfig.cursorX = linhaTam;
 }
 
 void editorProcessarTeclasPressionadas() {
@@ -243,11 +369,17 @@ void editorProcessarTeclasPressionadas() {
             editConfig.cursorX = 0;
             break;
         case END:
-            editConfig.cursorX = editConfig.telaColunas - 1;
+            if(editConfig.cursorY < editConfig.numLinhas)
+                editConfig.cursorX = editConfig.linha[editConfig.cursorY].tam;
             break;
         case PAGE_UP:
         case PAGE_DOWN:
             {
+                if(caracter == PAGE_UP) editConfig.cursorY = editConfig.linhaOffset;
+                else if(caracter == PAGE_DOWN) { 
+                    editConfig.cursorY = editConfig.linhaOffset + editConfig.telaLinhas - 1;
+                    if(editConfig.cursorY > editConfig.numLinhas) editConfig.cursorY = editConfig.numLinhas;
+                }
                 int vezes = editConfig.telaLinhas;
                 while(vezes--) editorMoverCursor(caracter == PAGE_UP ? SETA_CIMA : SETA_BAIXO);
             }
@@ -266,13 +398,19 @@ void editorProcessarTeclasPressionadas() {
 void inicializarEditor() {
     editConfig.cursorX = 0;
     editConfig.cursorY = 0;
+    editConfig.renderX = 0;
+    editConfig.linhaOffset = 0;
+    editConfig.colunaOffset = 0;
+    editConfig.numLinhas = 0;
+    editConfig.linha = NULL;
 
     if(getTamanhoTela(&editConfig.telaLinhas, &editConfig.telaColunas) == -1) erro("getWindowsSize");
 }
 
-int main() {
+int main(int argContagem, char *argValor[]) {
     ligarRawMode();
     inicializarEditor();
+    if(argContagem >= 2) editorAbrir(argValor[1]);
 
     while(1) {
         editorRecarregarTela();
