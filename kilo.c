@@ -6,11 +6,13 @@
 #include <ctype.h>
 #include <errno.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/types.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 
 // Constantes
@@ -49,6 +51,9 @@ struct editorConfiguracao {
     int telaColunas;
     int numLinhas;
     editLinha *linha;
+    char *nomeArquivo;
+    char statusMsg[80];
+    time_t statusMsg_tempo;
     struct termios termiosEstadoOriginal;
 };
 
@@ -238,6 +243,9 @@ int editorLinhaCxParaRx (editLinha *linha, int cx) {
 
 // Arquivos i/o
 void editorAbrir(char *nomeArquivo) {
+    free(editConfig.nomeArquivo);
+    editConfig.nomeArquivo = strdup(nomeArquivo);
+
     FILE *abrirArq = fopen(nomeArquivo, "r");
     if(!abrirArq) erro("fopen");
 
@@ -296,10 +304,38 @@ void editorDesenharLinhas(struct bufferAnexo *bufan) {
         }
 
         bufanAnexar(bufan, "\x1b[K", 3);
-        if(y < editConfig.telaLinhas - 1) {
-            bufanAnexar(bufan, "\r\n", 3);
-        }
+        bufanAnexar(bufan, "\r\n", 3);
     }
+}
+
+void editorDesenharBarraStatus(struct bufferAnexo *bufan) {
+    bufanAnexar(bufan, "\x1b[7m", 4);
+    char status[80], rstatus[80];
+    int tam = snprintf(status, sizeof(status), "%.20s - %d linhas",
+                        editConfig.nomeArquivo ? editConfig.nomeArquivo : "[Sem nome]", editConfig.numLinhas);
+    int rtam = snprintf(rstatus, sizeof(rstatus), "%d/%d", editConfig.cursorY + 1, editConfig.numLinhas);
+    if(tam > editConfig.telaColunas) tam = editConfig.telaColunas;
+    bufanAnexar(bufan, status, tam);
+    while(tam < editConfig.telaLinhas) {
+        if(editConfig.telaColunas - tam == rtam) {
+            bufanAnexar(bufan, rstatus, rtam);
+            break;
+        }
+        else {
+            bufanAnexar(bufan, " ", 1);
+            tam++;
+        }
+        
+    }
+    bufanAnexar(bufan, "\x1b[m", 3);
+    bufanAnexar(bufan, "\r\n", 2);
+}
+
+void editorDesenharBarraMensagem(struct bufferAnexo *bufan) {
+    bufanAnexar(bufan, "\x1b[K", 3);
+    int msgTam = strlen(editConfig.statusMsg);
+    if(msgTam > editConfig.telaColunas) msgTam = editConfig.telaColunas;
+    if(msgTam && time(NULL) - editConfig.statusMsg_tempo < 5) bufanAnexar(bufan, editConfig.statusMsg, msgTam);
 }
 
 void editorRecarregarTela() {
@@ -311,6 +347,8 @@ void editorRecarregarTela() {
     bufanAnexar(&bufan, "\x1b[H", 3);
     
     editorDesenharLinhas(&bufan);
+    editorDesenharBarraStatus(&bufan);
+    editorDesenharBarraMensagem(&bufan);
     
     char buffer[32];
     snprintf(buffer, sizeof(buffer), "\x1b[%d;%dH", (editConfig.cursorY - editConfig.linhaOffset) +1,
@@ -321,6 +359,14 @@ void editorRecarregarTela() {
 
     write(STDOUT_FILENO, bufan.buffer, bufan.tamBuffer);
     bufanFree(&bufan);
+}
+
+void editorSetMensagemStatus(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(editConfig.statusMsg, sizeof(editConfig.statusMsg), fmt, ap);
+    va_end(ap);
+    editConfig.statusMsg_tempo = time(NULL);
 }
 
 // Input
@@ -403,8 +449,12 @@ void inicializarEditor() {
     editConfig.colunaOffset = 0;
     editConfig.numLinhas = 0;
     editConfig.linha = NULL;
-
+    editConfig.nomeArquivo = NULL;
+    editConfig.statusMsg[0] = '\0';
+    editConfig.statusMsg_tempo = 0;
+    
     if(getTamanhoTela(&editConfig.telaLinhas, &editConfig.telaColunas) == -1) erro("getWindowsSize");
+    editConfig.telaLinhas -= 2;
 }
 
 int main(int argContagem, char *argValor[]) {
@@ -412,10 +462,11 @@ int main(int argContagem, char *argValor[]) {
     inicializarEditor();
     if(argContagem >= 2) editorAbrir(argValor[1]);
 
+    editorSetMensagemStatus("AJUDA: Esc para fechar o programa.");
+
     while(1) {
         editorRecarregarTela();
         editorProcessarTeclasPressionadas();
     }
-
     return 0;
 }
